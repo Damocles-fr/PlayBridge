@@ -8,9 +8,12 @@ param(
     [switch]$LoadOnly
 )
 
-$PlayBridge_Version = '13.0.1'
+$PlayBridge_Version = '13.0.2'
 $PlayBridge_DefaultPlayer = 'C:\Program Files\MPC-BE\mpc-be64.exe'
 $PlayBridge_DefaultArguments = '/fullscreen'
+# PotPlayer has no command-line option for fullscreen (PotPlayer > Preferences > General > Startup > Window size).
+# A "/fullscreen" given to it (copied from an old MPC-JF script) can keep the video from opening: never passed to it.
+$PlayBridge_NoFullscreenExes = @('potplayermini64.exe', 'potplayermini.exe', 'potplayer64.exe', 'potplayer.exe')
 # Longest wait for one "is the file there?" check. Past that (NAS disks waking up, slow network),
 # the player is started anyway and waits for the disk itself.
 $PlayBridge_CheckTimeoutMs = 2000
@@ -461,17 +464,51 @@ function New-PlayBridgeRule([string]$JellyfinPath, [string]$WindowsPath) {
 # Player, messages, log
 # ---------------------------------------------------------------------------
 
+# Splits the player options like a Windows command line: spaces separate them, "quoted parts" stay
+# together (/sub="C:\My subs\a.srt" is one option). The options are kept exactly as typed.
+function Split-PlayBridgeOptions([string]$Arguments) {
+    $list = New-Object System.Collections.Generic.List[string]
+    foreach ($m in [regex]::Matches([string]$Arguments, '(?:[^\s"]+|"[^"]*"?)+')) { $list.Add($m.Value) }
+    return , $list.ToArray()
+}
+
+# What the player receives, one value per argument: the video first, unless the options contain %1 to place it
 function Get-PlayBridgeArgumentList([string]$Arguments, [string]$Target) {
-    # The video goes first, unless the options contain %1 to place it
     $list = New-Object System.Collections.Generic.List[string]
     $placed = $false
-    foreach ($m in [regex]::Matches([string]$Arguments, '"([^"]*)"|(\S+)')) {
-        if ($m.Groups[1].Success) { $a = $m.Groups[1].Value } else { $a = $m.Groups[2].Value }
+    foreach ($t in (Split-PlayBridgeOptions $Arguments)) {
+        $a = $t.Replace('"', '')
         if ($a -eq '%1') { $a = $Target; $placed = $true }
         $list.Add($a)
     }
     if (-not $placed) { $list.Insert(0, $Target) }
     return , $list.ToArray()
+}
+
+# Command line given to the player: the video always in quotes, the options exactly as typed
+# (like a Windows shortcut or the old MPC-JF script).
+function Get-PlayBridgeCommandLine([string]$Arguments, [string]$Target) {
+    $video = '"' + ([string]$Target).Replace('"', '""') + '"'
+    $line = New-Object System.Collections.Generic.List[string]
+    $placed = $false
+    foreach ($t in (Split-PlayBridgeOptions $Arguments)) {
+        if ($t.Replace('"', '') -eq '%1') { $line.Add($video); $placed = $true } else { $line.Add($t) }
+    }
+    if (-not $placed) { $line.Insert(0, $video) }
+    return , $line.ToArray()
+}
+
+function Test-PlayBridgeFullscreenArg([string]$Arg) {
+    return ([string]$Arg -match '^(/|-{1,2})(fullscreen|fs)$')
+}
+
+# Options of the player, without the fullscreen options that this player doesn't understand (PotPlayer)
+function Repair-PlayBridgeArguments([string]$Player, [string]$Arguments) {
+    $exe = ((([string]$Player).Trim().Trim('"')) -split '[\\/]')[-1].ToLowerInvariant()
+    if ($PlayBridge_NoFullscreenExes -notcontains $exe) { return [string]$Arguments }
+    $kept = New-Object System.Collections.Generic.List[string]
+    foreach ($t in (Split-PlayBridgeOptions $Arguments)) { if (-not (Test-PlayBridgeFullscreenArg $t.Replace('"', ''))) { $kept.Add($t) } }
+    return ($kept.ToArray() -join ' ')
 }
 
 # Player and options from PlayBridge.ini, or the defaults of the old MPC-JF script
@@ -483,14 +520,13 @@ function Get-PlayBridgePlayer($Config) {
         if ($null -eq $playerArgs) { $playerArgs = $PlayBridge_DefaultArguments }
     }
     if ($null -eq $playerArgs) { $playerArgs = '' }
-    return @{ Path = $player; Arguments = [string]$playerArgs }
+    return @{ Path = $player; Arguments = (Repair-PlayBridgeArguments $player ([string]$playerArgs)); Typed = [string]$playerArgs }
 }
 
 function Start-PlayBridgePlayer($Config, [string]$Target) {
     $p = Get-PlayBridgePlayer $Config
-    $argv = Get-PlayBridgeArgumentList $p.Arguments $Target
     # Start-Process: the player is fully detached from this hidden PowerShell
-    Start-Process -FilePath $p.Path -ArgumentList @($argv | ForEach-Object { '"' + ($_ -replace '"', '""') + '"' }) -ErrorAction Stop
+    Start-Process -FilePath $p.Path -ArgumentList (Get-PlayBridgeCommandLine $p.Arguments $Target) -ErrorAction Stop
 }
 
 function Show-PlayBridgeMessage([string]$Text, [string]$Buttons = 'OK', [string]$Icon = 'Information') {
@@ -676,7 +712,9 @@ if ($Url -match '^(playbridge|mpcjf):(//)?playbridge-test/?$') {
 }
 
 # first line written at once: if it is missing, the browser never started PlayBridge
-Write-PlayBridgeLog $here @('', ('{0}  PlayBridge {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $PlayBridge_Version), ('  link     : ' + $Url))
+$linkNote = ''
+if ($Url -match '^mpcjf:') { $linkNote = '  (old MPC-JF browser script)' }
+Write-PlayBridgeLog $here @('', ('{0}  PlayBridge {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $PlayBridge_Version), ('  link     : ' + $Url + $linkNote))
 $log = New-Object System.Collections.Generic.List[string]
 $watch = [System.Diagnostics.Stopwatch]::StartNew()
 $config = $null
@@ -684,6 +722,7 @@ $config = $null
 function Invoke-PlayBridgePlay([string]$Target, [string]$Label) {
     $log.Add(('  play     : {0}  ({1}, {2} ms)' -f $Target, $Label, $watch.ElapsedMilliseconds))
     $p = Get-PlayBridgePlayer $config
+    if ($p.Typed -ne $p.Arguments) { $log.Add('  options  : fullscreen option ignored: PotPlayer has none (PotPlayer > Preferences > General > Startup > Window size)') }
     try {
         Start-PlayBridgePlayer $config $Target
         $log.Add('  player   : ' + $p.Path + ' ' + $p.Arguments)

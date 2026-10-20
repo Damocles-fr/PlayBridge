@@ -476,6 +476,17 @@ foreach ($kv in $tasks.GetEnumerator()) {
 # Reads the player line and the "YOUR NAS CONFIG" lines of an old MPCJF.ps1 (MPC-JF 12.1 and older).
 # Simple lines ($path = $path -replace "\\share\\X\\", "D:") become folder links,
 # anything else is kept as is in PlayBridge-custom.ps1.
+# "$env:ProgramFiles\DAUM\..." or "%ProgramFiles%\..." in an old script => real path
+function Expand-PlayBridgeLegacyPath([string]$Path) {
+    $p = [string]$Path
+    foreach ($m in @([regex]::Matches($p, '\$\{env:([^}]+)\}|\$env:(\w+)'))) {
+        if ($m.Groups[1].Success) { $n = $m.Groups[1].Value } else { $n = $m.Groups[2].Value }
+        $p = $p.Replace($m.Value, [string][Environment]::GetEnvironmentVariable($n))
+    }
+    return [Environment]::ExpandEnvironmentVariables($p)
+}
+
+# Settings of an old hand-edited MPCJF.ps1 (MPC-JF 12.1 and older): player, fullscreen, "YOUR NAS CONFIG" lines
 function Read-PlayBridgeLegacyScript([string]$File) {
     if (-not $File -or -not [System.IO.File]::Exists($File)) { return $null }
     $lines = @(Read-PlayBridgeTextFile $File)
@@ -483,17 +494,25 @@ function Read-PlayBridgeLegacyScript([string]$File) {
     $res = @{ Player = ''; Fullscreen = $false; Paths = @(); Custom = @() }
     $paths = New-Object System.Collections.Generic.List[object]
     $custom = New-Object System.Collections.Generic.List[string]
+    $exeVars = @{}
     $inNas = $false
     foreach ($line in $lines) {
         $t = $line.Trim()
-        if ($t -match '^&\s*["'']([^"'']+?\.exe)["''](.*)$') {
-            $res.Player = $Matches[1]
-            $res.Fullscreen = ($Matches[2] -match '(/|--)(fullscreen|fs)\b')
+        if ($t.StartsWith('#')) { if ($t -match 'YOUR NAS CONFIG') { $inNas = $true }; continue }
+        # $player = "C:\...\PotPlayerMini64.exe"
+        if ($t -match '^\$(\w+)\s*=\s*["'']([^"'']+?\.exe)["'']\s*(#.*)?$') { $exeVars[$Matches[1].ToLowerInvariant()] = $Matches[2]; continue }
+        # the line that starts the player: & "C:\...exe" ..., & $player ..., Start-Process "C:\...exe" ...
+        $exe = $null; $rest = ''
+        if ($t -match '^(?:&|Start-Process(?:\s+-FilePath)?)\s*["'']([^"'']+?\.exe)["''](.*)$') { $exe = $Matches[1]; $rest = $Matches[2] }
+        elseif ($t -match '^(?:&|Start-Process(?:\s+-FilePath)?)\s*\$(\w+)\b(.*)$' -and $exeVars.ContainsKey($Matches[1].ToLowerInvariant())) { $exe = $exeVars[$Matches[1].ToLowerInvariant()]; $rest = $Matches[2] }
+        if ($exe) {
+            $res.Player = Expand-PlayBridgeLegacyPath $exe
+            $res.Fullscreen = ($rest -match '(^|[\s"''`])(/|-{1,2})(fullscreen|fs)(?=$|[\s"''`])')
             continue
         }
-        if ($t -match 'YOUR NAS CONFIG') { $inNas = $true; continue }
-        if (-not $inNas -or $t -eq '' -or $t.StartsWith('#')) { continue }
-        if ($t -match '^(echo|Write-Host|Write-Output)\b') { continue }
+        if (-not $inNas -or $t -eq '') { continue }
+        if ($t -match '^(echo|Write-Host|Write-Output|exit|return|pause|Read-Host)\b') { continue }   # would stop or block PlayBridge
+        if ($t -match '\.exe\b') { continue }                                                         # another way to start a player
         if ($t -match '^\$path\s*=\s*\$path\s+-i?replace\s*(["''])(.+?)\1\s*,\s*(["''])(.*?)\3\s*(#.*)?$') {
             $pattern = $Matches[2]
             $to = $Matches[4]
@@ -513,12 +532,70 @@ function Read-PlayBridgeLegacyScript([string]$File) {
     return $res
 }
 
+# Player of an older installation, checked on this PC. '' when it no longer exists (the setup then proposes
+# the players it finds). PotPlayer64.exe only starts PotPlayerMini64.exe: the Mini one is used, like the setup does.
+function Resolve-PlayBridgeImportedPlayer([string]$Exe) {
+    $p = ([string]$Exe).Trim().Trim('"')
+    if (-not $p) { return '' }
+    try {
+        $dir = [System.IO.Path]::GetDirectoryName($p)
+        $name = [System.IO.Path]::GetFileName($p).ToLowerInvariant()
+    } catch { return $p }
+    if ($dir -and $PlayBridge_LauncherExes -contains $name) {
+        foreach ($mini in 'PotPlayerMini64.exe', 'PotPlayerMini.exe') {
+            $c = [System.IO.Path]::Combine($dir, $mini)
+            if ((Test-PlayBridgePath $c) -eq $true) { return $c }
+        }
+    }
+    if ((Test-PlayBridgePath $p) -eq $false) { return '' }   # no answer in time (network drive): kept
+    return $p
+}
+
+# Options of an imported player: the old MPC-JF script always added "/fullscreen", an MPC option.
+# $null = let the setup choose (its usual default for the player it proposes).
+function Get-PlayBridgeImportedArguments([string]$Player, [bool]$Fullscreen) {
+    if (-not $Player) { if ($Fullscreen) { return $null } else { return '' } }
+    if (-not $Fullscreen) { return '' }
+    $info = Get-PlayBridgePlayerInfo $Player
+    if ($info.Fullscreen) { return $info.Fullscreen }                         # the right option for this player
+    if (-not $info.Known) { return (Repair-PlayBridgeArguments $Player '/fullscreen') }   # other player: as before (never for PotPlayer)
+    return ''                                                                  # PotPlayer, KMPlayer...: set in the player
+}
+
 function Get-PlayBridgeProtocolCommand([string]$SubKey = $ProtocolSubKey) {
     try {
         $k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($SubKey + '\shell\open\command')
         if ($k) { $v = [string]$k.GetValue(''); $k.Close(); return $v }
     } catch { }
     return ''
+}
+
+# Command of the old mpcjf:// link registered for all users (MPCJF.reg)
+function Get-PlayBridgeMachineProtocolCommand {
+    try {
+        $k = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\Classes\MPCJF\shell\open\command')
+        if ($k) { $v = [string]$k.GetValue(''); $k.Close(); return $v }
+    } catch { }
+    return ''
+}
+
+# MPCJF.ps1 files of older installations, the one really started by the mpcjf:// link first
+# (MPCJF.reg or Install-MPCJF-HiddenProtocol.ps1 may point to any folder)
+function Get-PlayBridgeLegacyScriptFiles {
+    $files = New-Object System.Collections.Generic.List[string]
+    foreach ($cmd in @((Get-PlayBridgeProtocolCommand $LegacyProtocolSubKey), (Get-PlayBridgeMachineProtocolCommand))) {
+        if (-not $cmd) { continue }
+        if ($cmd -match '-File\s+(?:"([^"]+)"|(\S+))') {
+            if ($Matches[1]) { $f = $Matches[1] } else { $f = $Matches[2] }
+            if ($f -match '\.ps1$') { $files.Add([Environment]::ExpandEnvironmentVariables($f)) }
+        } elseif ($cmd -match '"?([^"]+?[\\/])[^"\\/]+\.vbs"?') {
+            $files.Add([Environment]::ExpandEnvironmentVariables($Matches[1]) + 'MPCJF.ps1')
+        }
+    }
+    $files.Add((Join-Path $OldManualDir 'MPCJF.ps1'))
+    $files.Add((Join-Path $OldHiddenDir 'MPCJF.ps1'))
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($f in $files) { if ($f -and $seen.Add($f)) { $f } }
 }
 
 # What the setup shows first: the current settings, else those of an older installation
@@ -530,6 +607,7 @@ function Get-PlayBridgeStartSettings {
     if ([System.IO.File]::Exists($ini)) {
         $c = Read-PlayBridgeConfig $ini
         foreach ($k in @($c.Keys)) { $s[$k] = $c[$k] }
+        if ($null -ne $s.Arguments) { $s.Arguments = Repair-PlayBridgeArguments $s.Player $s.Arguments }   # "/fullscreen" imported for PotPlayer by 13.0.1
         $s.Source = 'current'
         return $s
     }
@@ -538,23 +616,18 @@ function Get-PlayBridgeStartSettings {
     if ([System.IO.File]::Exists($testIni)) {
         $c = Read-PlayBridgeConfig $testIni
         foreach ($k in @($c.Keys)) { $s[$k] = $c[$k] }
+        if ($null -ne $s.Arguments) { $s.Arguments = Repair-PlayBridgeArguments $s.Player $s.Arguments }
         $customOld = Join-Path $OldTestDir 'MPCJF-custom.ps1'
         if ([System.IO.File]::Exists($customOld)) { $s.Custom = @(Read-PlayBridgeTextFile $customOld | Where-Object { $_ -notmatch '^\s*#' }) }
         $s.Source = $testIni
         return $s
     }
     $cmd = Get-PlayBridgeProtocolCommand $LegacyProtocolSubKey
-    $files = @()
-    if ($cmd -match 'wscript') { $files += (Join-Path $OldHiddenDir 'MPCJF.ps1') }   # the copy really used by the link
-    $files += (Join-Path $OldManualDir 'MPCJF.ps1'), (Join-Path $OldHiddenDir 'MPCJF.ps1')
-    foreach ($f in $files) {
+    foreach ($f in @(Get-PlayBridgeLegacyScriptFiles)) {
         $old = Read-PlayBridgeLegacyScript $f
         if (-not $old) { continue }
-        $s.Player = $old.Player
-        $info = Get-PlayBridgePlayerInfo $old.Player
-        if ($old.Fullscreen -and $info.Fullscreen) { $s.Arguments = $info.Fullscreen }
-        elseif ($old.Fullscreen) { $s.Arguments = '/fullscreen' }
-        else { $s.Arguments = '' }
+        $s.Player = Resolve-PlayBridgeImportedPlayer $old.Player
+        $s.Arguments = Get-PlayBridgeImportedArguments $s.Player ([bool]$old.Fullscreen)
         if ($cmd -match 'wscript') { $s.HideWindow = $true }
         $s.Paths = $old.Paths
         $s.Custom = $old.Custom
@@ -1037,7 +1110,7 @@ __STYLES__
               </StackPanel>
             </DockPanel>
             <TextBlock Style="{StaticResource Hint}" Margin="36,6,0,0"
-                       Text="Already have Violentmonkey (or Tampermonkey) in this browser? Go to step 2."/>
+                       Text="Already have Violentmonkey (or Tampermonkey) in this browser? Go to step 2. Delete the old MPC-JF script in it, if any: two scripts open the video twice."/>
             <TextBlock x:Name="VMChromeHint" Style="{StaticResource Hint}" Foreground="#9A5B00" Margin="36,4,0,0"
                        Text="Then right-click the extension icon &#x2192; Manage extension &#x2192; turn on 'Allow User Scripts'."/>
           </StackPanel>
@@ -1476,6 +1549,13 @@ function Update-PlayBridgePlayerUi([bool]$Resync) {
     $path = ([string]$ui.PlayerPath.Text).Trim().Trim('"')
     $info = Get-PlayBridgePlayerInfo $path
     $ui.Fullscreen.IsEnabled = [bool]$info.Fullscreen
+    if ($info.Known -and -not $info.Fullscreen -and $ui.Fullscreen.IsChecked) {
+        # PotPlayer, KMPlayer...: no fullscreen option to add, the box must not look ticked
+        $was = $script:State.Updating
+        $script:State.Updating = $true
+        $ui.Fullscreen.IsChecked = $false
+        $script:State.Updating = $was
+    }
     $ui.FullscreenNote.Text = $info.Note
     Show-PlayBridge $ui.FullscreenNote ([bool]$info.Note -and -not $info.Fullscreen)
     if (-not $path) {
@@ -1670,7 +1750,7 @@ function Get-PlayBridgeSettingsFromUi {
     $b = Get-PlayBridgeSelectedBrowser
     return @{
         Player     = ([string]$ui.PlayerPath.Text).Trim().Trim('"')
-        Arguments  = ([string]$ui.PlayerArgs.Text).Trim()
+        Arguments  = (Repair-PlayBridgeArguments ([string]$ui.PlayerPath.Text) (([string]$ui.PlayerArgs.Text).Trim()))
         HideWindow = ($ui.HideWindow.IsEnabled -and $ui.HideWindow.IsChecked -eq $true)
         Mode       = (Get-PlayBridgeSelectedMode)
         Jellyfin   = $script:State.Jellyfin
