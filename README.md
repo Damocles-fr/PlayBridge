@@ -126,7 +126,7 @@ All these players are detected by the setup (usual folders, installers, Scoop, P
 | **mpv**, **mpv.net** | `--fs` | Yes |
 | **SMPlayer** | `-fullscreen` | Yes |
 | **MPC-QT**, **KMPlayer**, **GOM Player** | In the player's own settings | Should work, not tested |
-| **JRiver Media Center** (not detected: **Browse...** to `MC36.exe`) | In JRiver: Tools → Options → General → Behavior → **Jump on play (video)** = **Display View (even in playing now)** (more reliable than the `/Mode Fullscreen` option) | Yes (tested by a user) |
+| **JRiver Media Center** (not detected: **Browse...** to `MC36.exe`) | In JRiver: Tools → Options → General → Behavior → **Jump on play (video)** = **Display View (even in playing now)** & **View -> Standard View** | Yes (tested by a user) |
 
 **Options** box: extra command-line options of your player. Put `%1` where the video must go if your player needs it (the video goes first otherwise).
 
