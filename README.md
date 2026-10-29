@@ -116,7 +116,7 @@ Chosen on page 1, **2. How videos open**.
 > A stream or download link contains your Jellyfin access token. Your player may keep it in its "recent files" list. PlayBridge never writes it in its own log.
 
 ### Supported players
-All these players are detected by the setup (usual folders, installers, Scoop, PATH). Any other player works with **Browse...**.
+Players are detected by the setup (usual folders, installers, Scoop, PATH). Any other player works with **Browse...**.
 
 | Player | Fullscreen | Stream and download modes (http links) |
 |---|---|---|
